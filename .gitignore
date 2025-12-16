@@ -1,9 +1,12 @@
 my_test/
 *.bed
-*.ipynb
 QuantNado.egg-info/
 *__pycache__/
 data/
 *.sh
 QuantNado/_version.py
 logs/
+epiquant
+examples/bigwigs/
+examples/dataset.zarr
+.DS_Store

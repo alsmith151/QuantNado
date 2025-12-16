@@ -25,6 +25,10 @@ dependencies = [
     "pyranges",
     "torch",
     "modisco-lite",
+    "pyBigWig",
+    "xarray",
+    "zarr",
+    "dask",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +39,7 @@ dev = [
 [project.scripts]
 quantnado-call-peaks = "QuantNado.cli:call_peaks_main"
 quantnado-make-dataset = "QuantNado.cli:make_dataset_main"
+quantnado-bam-to-xarray = "QuantNado.cli:bam_to_xarray_main"
 
 [tool.setuptools_scm]
 write_to = "QuantNado/_version.py"
