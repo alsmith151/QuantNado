@@ -29,6 +29,9 @@ dependencies = [
     "xarray",
     "zarr",
     "dask",
+    "sparse",
+    "tqdm",
+    "pysam",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +42,8 @@ dev = [
 [project.scripts]
 quantnado-call-peaks = "QuantNado.cli:call_peaks_main"
 quantnado-make-dataset = "QuantNado.cli:make_dataset_main"
-quantnado-bam-to-xarray = "QuantNado.cli:bam_to_xarray_main"
+quantnado-make-xarray = "QuantNado.cli:make_xarray_main"
+quantnado-make-zarr = "QuantNado.cli:make_zarr_main"
 
 [tool.setuptools_scm]
 write_to = "QuantNado/_version.py"

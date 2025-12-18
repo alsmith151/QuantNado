@@ -1,0 +1,32 @@
+name: quantnado_dev
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - anndata=0.12.6
+  - bokeh=3.8.1
+  - click=8.2.1
+  - dask=2025.12.0
+  - h5py=3.14.0
+  - hvplot=0.12.1
+  - ipykernel=7.1.0
+  - ipython=9.8.0
+  - ipywidgets=8.1.8
+  - jupyter_bokeh=4.0.5
+  - loguru=0.7.3
+  - matplotlib=3.10.3
+  - numba=0.61.2
+  - numpy=2.0.1
+  - pandas=2.3.0
+  - python=3.11.13
+  - scikit-learn=1.7.0
+  - scipy=1.15.3
+  - seaborn=0.13.2
+  - sparse=0.17.0
+  - tqdm=4.67.1
+  - xarray=2025.12.0
+  - zarr=3.1.5
+  - pip:
+    - crested==1.5.0
+    - pysam==0.23.3

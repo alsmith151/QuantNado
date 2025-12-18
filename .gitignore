@@ -10,3 +10,5 @@ epiquant
 examples/bigwigs/
 examples/dataset.zarr
 .DS_Store
+*.zarr
+notebooks/

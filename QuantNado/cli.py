@@ -1,5 +1,10 @@
+import os
 import warnings
+os.environ["KMP_WARNINGS"] = "0"
+os.environ["OMP_NUM_THREADS"] = "1"
 
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=Warning)
 warnings.filterwarnings("ignore", message="pkg_resources*")
 
 import argparse
@@ -11,6 +16,7 @@ from loguru import logger
 
 from QuantNado.call_quantile_peaks import call_peaks_from_bigwig_dir
 from QuantNado.make_dataset import make_dataset
+from QuantNado.make_zarr_store import combine_cached_zarrs, process_and_cache_bam
 
 
 def call_peaks_main():
@@ -62,19 +68,19 @@ def call_peaks_main():
     )
     parser.add_argument(
         "--log-file",
-        default="logs/quantnado.log",
-        type=Path,
-        help="Path to the log file (default: 'logs/quantnado.log')",
+        type=str,
+        default="quantnado_processing.log",
+        help="Path to the log file (default: quantnado_processing.log)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-    
+
     if not args.log_file.parent.exists():
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
 
     if args.log_file.exists():
         args.log_file.unlink()
-        
+
     _setup_logging(args.log_file, args.verbose)
 
     try:
@@ -131,22 +137,21 @@ def make_dataset_main():
     )
     parser.add_argument(
         "--log-file",
-        default="logs/quantnado.log",
-        type=Path,
-        help="Path to the log file (default: 'logs/quantnado.log')",
+        type=str,
+        default="quantnado_processing.log",
+        help="Path to the log file (default: quantnado_processing.log)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    
     if not args.log_file.parent.exists():
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
 
     if args.log_file.exists():
         args.log_file.unlink()
-        
+
     _setup_logging(args.log_file, args.verbose)
-    
+
     try:
         make_dataset(
             bigwig_dir=args.bigwig_dir,
@@ -162,6 +167,73 @@ def make_dataset_main():
         logger.error(f"Dataset generation failed: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         sys.exit(1)
+
+
+def make_zarr_main():
+    parser = argparse.ArgumentParser(
+        description="Process BAM files and create a Zarr dataset."
+    )
+    parser.add_argument(
+        "--bam-file",
+        help="Path to a single BAM file to process and cache.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        required=True,
+        type=Path,
+        help="Directory to store cached Zarr files.",
+    )
+    parser.add_argument(
+        "--contig",
+        required=True,
+        help="Chromosome/contig name.",
+    )
+    parser.add_argument(
+        "--chrom-size",
+        type=int,
+        required=True,
+        help="Size of the chromosome/contig.",
+    )
+    parser.add_argument(
+        "--combine",
+        action="store_true",
+        help="Combine cached Zarr files into a final dataset.",
+    )
+    parser.add_argument(
+        "--metadata-path",
+        help="Path to metadata CSV file.",
+    )
+    parser.add_argument(
+        "--output-path",
+        help="Path to save the combined Zarr dataset.",
+    )
+
+    args = parser.parse_args()
+
+    if args.bam_file:
+        process_and_cache_bam(
+            bam_file=args.bam_file,
+            contig=args.contig,
+            chrom_size=args.chrom_size,
+            cache_dir=args.cache_dir,
+        )
+
+    if args.combine:
+        if not args.metadata_path or not args.output_path:
+            raise ValueError(
+                "--metadata-path and --output-path are required for combining datasets."
+            )
+
+        import pandas as pd
+
+        metadata_df = pd.read_csv(args.metadata_path)
+        combine_cached_zarrs(
+            cache_dir=args.cache_dir,
+            metadata_df=metadata_df,
+            output_path=args.output_path,
+        )
+
+    print("Zarr processing complete.")
 
 
 def _setup_logging(log_path: Path, verbose: bool):
