@@ -240,7 +240,7 @@ def process_bam(
 
 def combine_cached_zarrs(
     cache_dir: Path,
-    metadata_df: pd.DataFrame,
+    metadata_df: pd.DataFrame | str | Path,
     output_path: Path,
 ) -> None:
     """
@@ -254,10 +254,15 @@ def combine_cached_zarrs(
 
     Parameters:
     - cache_dir: Directory containing cached Zarr files (with chromosome groups).
-    - metadata_df: DataFrame containing metadata for the BAM files.
+    - metadata_df: DataFrame or path to CSV file containing metadata for the BAM files.
     - output_path: Path to save the combined Zarr dataset.
     """
     logger.info(f"Combining cached Zarr files from {cache_dir}")
+
+    # Load metadata if it's a file path
+    if isinstance(metadata_df, (str, Path)):
+        logger.info(f"Loading metadata from {metadata_df}")
+        metadata_df = pd.read_csv(metadata_df)
 
     try:
         # Load all cached datasets
