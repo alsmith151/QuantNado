@@ -1,260 +1,335 @@
-import argparse
-import logging
-
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from threading import Lock
 
 import bamnado
 import numpy as np
 import pandas as pd
 import sparse
 import xarray as xr
+import zarr
+from loguru import logger
+
+# Constants for bamnado parameters
+BIN_SIZE = 1
+SCALE_FACTOR = 1.0
+USE_FRAGMENT = False
+IGNORE_SCAFFOLD_CHROMS = True
 
 
-
-# Configure logging to include a file handler
-log_file = "quantnado_processing.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),  # Logs to console
-        logging.FileHandler(log_file),  # Logs to file
-    ],
-)
-logger = logging.getLogger(__name__)
-logger.info("Logging initialized. Logs will be written to quantnado_processing.log")
-
-
-def process_bam(
-    assay_type: str,
-    fasta_path: str,
-    contig: str,
-    start: int = 0,
-    end: Optional[int] = None,
-    stepsize: int = 1_000_000,
-    chunk_size: int = 100_000,
-):
+class BamZarrStore:
     """
-    Generalized function to process assay data (e.g., methylation, ATAC, RNA).
+    Context manager for creating and managing BAM-to-Zarr conversions.
+
+    Handles:
+    - Store creation and cleanup
+    - Thread-safe chromosome appending
+    - Metadata management
+    - Error handling and cleanup on failure
     """
-    signal = bamnado.get_signal_for_chromosome(
-        bam_path=fasta_path,
-        chromosome_name=contig,
-        bin_size=1,
-        scale_factor=1.0,
-        use_fragment=False,
-        ignore_scaffold_chromosomes=True,
-    )
-    return signal
+
+    def __init__(self, output_path: Path, sample_name: str, overwrite: bool = True):
+        self.output_path = Path(output_path)
+        self.sample_name = sample_name
+        self.overwrite = overwrite
+        self.root = None
+        self.write_lock = Lock()
+        self.sparsity_values = []
+
+    def __enter__(self):
+        """Initialize the zarr store."""
+        # Clean up existing store if overwrite is True
+        if self.overwrite and self.output_path.exists():
+            shutil.rmtree(self.output_path)
+            logger.info(f"Removed existing zarr file: {self.output_path}")
+
+        # Create zarr root group (Zarr v3 API - no need for DirectoryStore)
+        self.root = zarr.open_group(self.output_path, mode="w")
+
+        logger.info(f"Created zarr store: {self.output_path}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean up and finalize the zarr store."""
+        if exc_type:
+            # Error occurred - clean up
+            logger.error(f"Error during processing: ({exc_type}): {exc_val}")
+            logger.warning(f"Cleaning up incomplete store: {self.output_path}")
+            if self.output_path.exists():
+                shutil.rmtree(self.output_path)
+            return False  # Re-raise the exception
+
+        # Success - finalize metadata
+        if self.sparsity_values:
+            avg_sparsity = np.mean(self.sparsity_values)
+            self.root.attrs["sample"] = self.sample_name
+            self.root.attrs["description"] = "BAM coverage data across all chromosomes"
+            self.root.attrs["average_sparsity"] = f"{avg_sparsity:.2f}%"
+            self.root.attrs["num_chromosomes"] = len(self.sparsity_values)
+
+            logger.info(f"Dataset created (avg sparsity: {avg_sparsity:.2f}%)")
+
+        logger.info(f"Zarr store finalized: {self.output_path}")
+        return True
+
+    def append_chromosome(self, contig: str, ds_chrom: xr.Dataset, sparsity: float):
+        """
+        Thread-safe append of a chromosome dataset.
+
+        Parameters:
+        - contig: Chromosome name
+        - ds_chrom: xarray Dataset for this chromosome
+        - sparsity: Sparsity percentage for logging
+        """
+        with self.write_lock:
+            encoding = {"signal": {"chunks": (100_000,)}}
+            ds_chrom.to_zarr(
+                self.output_path,
+                mode="a",
+                group=contig,
+                encoding=encoding,
+                consolidated=False,
+            )
+            self.sparsity_values.append(sparsity)
+            logger.debug(f"Appended {contig} to store")
 
 
-def process_bam_files(
-    bam_files: list,
-    metadata_df: pd.DataFrame,
-    contig: str,
-    chrom_size: int,
-):
+def _select_optimal_dtype(max_val: float, contig: str) -> tuple[np.dtype, str]:
     """
-    Process multiple BAM files and create a single xarray Dataset.
+    Select optimal dtype based on maximum value to minimize storage.
 
     Parameters:
-    - bam_files: List of BAM file paths.
-    - metadata_df: DataFrame containing metadata for the BAM files.
-    - contig: Chromosome/contig name.
-    - chrom_size: Size of the chromosome/contig.
+    - max_val: Maximum value in the signal array
+    - contig: Chromosome name (for logging)
 
     Returns:
-    - xarray Dataset with sparse arrays for BAM coverage.
+    - dtype: NumPy dtype to use
+    - dtype_name: String name of the dtype
     """
-    signals = {}
-
-    for bam_file in bam_files:
-        sample_name = Path(bam_file).stem
-        signal = bamnado.get_signal_for_chromosome(
-            bam_path=bam_file,
-            chromosome_name=contig,
-            bin_size=1,
-            scale_factor=1.0,
-            use_fragment=False,
-            ignore_scaffold_chromosomes=True,
+    if max_val <= 65535:
+        # Use uint16 for 50% space savings
+        return np.uint16, "uint16"
+    elif max_val <= 4294967295:
+        # Use uint32 if values exceed uint16 range
+        logger.info(
+            f"  {contig}: Using uint32 (max coverage {max_val:.0f} exceeds uint16 range)"
         )
-        signals[sample_name] = signal
-
-    # Stack signals into a dense array
-    signal_array = np.stack([signals[sample] for sample in signals], axis=0)
-
-    # Convert to sparse array
-    signal_sparse = sparse.COO.from_numpy(signal_array)
-
-    # Create xarray Dataset
-    ds = xr.Dataset(
-        {
-            "signal": ("sample", "position", signal_sparse),
-        },
-        coords={
-            "sample": list(signals.keys()),
-            "position": np.arange(chrom_size),
-            "chromosome": contig,
-        },
-        attrs={
-            "description": "Sparse BAM coverage data",
-        },
-    )
-
-    # Add metadata
-    for col in metadata_df.columns:
-        if col != "sample_id":
-            ds.coords[col] = ("sample", metadata_df[col].values)
-
-    return ds
+        return np.uint32, "uint32"
+    else:
+        # Use float32 if values exceed uint32 range (extremely rare)
+        logger.warning(
+            f"  {contig}: Using float32 (max coverage {max_val:.0f} exceeds uint32 range)"
+        )
+        return np.float32, "float32"
 
 
-def process_and_cache_bam(
+def process_chromosome(
     bam_file: str,
     contig: str,
     chrom_size: int,
-    cache_dir: Path,
-):
+) -> tuple[str, xr.Dataset, float]:
     """
-    Process a single BAM file and cache the result as a Zarr file.
+    Worker function to process a single chromosome.
+
+    Returns:
+    - contig name
+    - Dataset for this chromosome
+    - Sparsity percentage
+    """
+    # Extract signal
+    signal = bamnado.get_signal_for_chromosome(
+        bam_path=bam_file,
+        chromosome_name=contig,
+        bin_size=BIN_SIZE,
+        scale_factor=SCALE_FACTOR,
+        use_fragment=USE_FRAGMENT,
+        ignore_scaffold_chromosomes=IGNORE_SCAFFOLD_CHROMS,
+    )
+
+    # Calculate sparsity
+    signal_sparse = sparse.COO.from_numpy(signal)
+    sparsity = 100 * (1 - signal_sparse.nnz / signal.size)
+
+    # Dynamically choose dtype based on max value
+    max_val = signal.max()
+    dtype, dtype_name = _select_optimal_dtype(max_val, contig)
+
+    logger.info(
+        f"  {contig}: {sparsity:.2f}% sparse (max: {max_val:.0f}, dtype: {dtype_name})"
+    )
+
+    # Convert signal to chosen dtype
+    signal_encoded = signal.astype(dtype)
+
+    # Create dataset for this chromosome
+    ds_chrom = xr.Dataset(
+        {"signal": (["position"], signal_encoded)},
+        coords={
+            "position": np.arange(chrom_size),
+            "chromosome": contig,
+        },
+    )
+
+    return contig, ds_chrom, sparsity
+
+
+def process_bam(
+    bam_file: str,
+    chromsizes: str | Path | dict,
+    cache_dir: Path,
+    max_workers: int = 4,
+) -> Path:
+    """
+    Process a single BAM file for all chromosomes in parallel using BamZarrStore.
+
+    Uses parallel processing with thread-safe incremental appending to avoid
+    slow concatenation - each chromosome is appended to the zarr store as soon
+    as it's processed.
 
     Parameters:
     - bam_file: Path to the BAM file.
-    - contig: Chromosome/contig name.
-    - chrom_size: Size of the chromosome/contig.
+    - chromsizes: Either a path to a chrom.sizes file or a dictionary mapping chromosome names to sizes.
     - cache_dir: Directory to store cached Zarr files.
+    - max_workers: Number of parallel threads to use (default: 4).
 
     Returns:
     - Path to the cached Zarr file.
     """
-    logger.info(f"Processing BAM file: {bam_file} for contig: {contig}")
-    try:
-        signal = bamnado.get_signal_for_chromosome(
-            bam_path=bam_file,
-            chromosome_name=contig,
-            bin_size=1,
-            scale_factor=1.0,
-            use_fragment=False,
-            ignore_scaffold_chromosomes=True,
-        )
-        logger.info(f"Signal extracted for contig: {contig}")
+    # Parse chromsizes if it's a file path
+    if isinstance(chromsizes, (str, Path)):
+        chromsizes_dict = {}
+        with open(chromsizes) as f:
+            for line in f:
+                chrom, size = line.strip().split()
+                # Only include main chromosomes (chr1-22, X, Y, M)
+                if chrom.startswith("chr") and "_" not in chrom:
+                    chromsizes_dict[chrom] = int(size)
+        logger.info(f"Loaded {len(chromsizes_dict)} chromosomes from {chromsizes}")
+        chromsizes = chromsizes_dict
 
-        # Create sparse array
-        signal_sparse = sparse.COO.from_numpy(signal)
-        logger.info(f"Sparse array created for contig: {contig}")
+    sample_name = Path(bam_file).stem
+    cache_file = cache_dir / f"{sample_name}.zarr"
 
-        # Convert sparse array to dense before saving
-        signal_dense = signal_sparse.todense()
-        logger.info(f"Converted sparse array to dense for contig: {contig}")
+    logger.info(
+        f"Processing BAM file: {bam_file} for {len(chromsizes)} chromosomes in parallel (max_workers={max_workers})"
+    )
 
-        # Create xarray Dataset with dense array
-        ds = xr.Dataset(
-            {
-                "signal": ("position", signal_dense),
-            },
-            coords={
-                "position": np.arange(chrom_size),
-                "chromosome": contig,
-            },
-            attrs={
-                "sample": Path(bam_file).stem,
-                "description": "Dense BAM coverage data",
-            },
-        )
-        logger.info(f"xarray Dataset created with dense array for contig: {contig}")
+    # Use context manager for automatic store management
+    with BamZarrStore(cache_file, sample_name, overwrite=True) as store:
+        # Process chromosomes in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all chromosome processing tasks
+            future_to_chrom = {
+                executor.submit(
+                    process_chromosome, bam_file, contig, chrom_size
+                ): contig
+                for contig, chrom_size in chromsizes.items()
+            }
 
-        # Ensure sparse encoding is used when saving to Zarr
-        encoding = {"signal": {"filters": None, "chunks": (1000,)}}
-        logger.info(f"Using sparse encoding for contig: {contig}")
+            # Process results as they complete and append immediately
+            for future in as_completed(future_to_chrom):
+                contig, ds_chrom, sparsity = future.result()
+                # Thread-safe appending handled by store.append_chromosome
+                store.append_chromosome(contig, ds_chrom, sparsity)
 
-        # Save to cache with sparse encoding
-        cache_file = cache_dir / f"{Path(bam_file).stem}_{contig}.zarr"
-        ds.to_zarr(cache_file, mode="w", encoding=encoding)
-        logger.info(f"Sparse data saved to cache: {cache_file}")
+        logger.info(f"Structure: {len(chromsizes)} chromosome groups")
 
-        return cache_file
-    except Exception as e:
-        logger.error(f"Error processing BAM file: {bam_file} for contig: {contig} - {e}")
-        raise
+    return cache_file
 
 
 def combine_cached_zarrs(
     cache_dir: Path,
     metadata_df: pd.DataFrame,
     output_path: Path,
-):
+) -> None:
     """
     Combine cached Zarr files into a single xarray Dataset.
 
+    Each cached zarr file has chromosomes as separate groups. This function:
+    1. Loads each sample's chromosome groups
+    2. Combines chromosomes within each sample
+    3. Combines all samples along the "sample" dimension
+    4. Adds metadata coordinates
+
     Parameters:
-    - cache_dir: Directory containing cached Zarr files.
+    - cache_dir: Directory containing cached Zarr files (with chromosome groups).
     - metadata_df: DataFrame containing metadata for the BAM files.
     - output_path: Path to save the combined Zarr dataset.
     """
-    # Load all cached datasets
-    cached_files = sorted(cache_dir.glob("*.zarr"))
-    datasets = [xr.open_zarr(f) for f in cached_files]
+    logger.info(f"Combining cached Zarr files from {cache_dir}")
 
-    # Combine datasets along the "sample" dimension
-    combined_ds = xr.concat(datasets, dim="sample")
+    try:
+        # Load all cached datasets
+        cached_files = sorted(cache_dir.glob("*.zarr"))
 
-    # Add metadata
-    for col in metadata_df.columns:
-        if col != "sample_id":
-            combined_ds.coords[col] = ("sample", metadata_df[col].values)
+        if not cached_files:
+            raise ValueError(f"No zarr files found in {cache_dir}")
 
-    # Save combined dataset
-    combined_ds.to_zarr(output_path, mode="w")
-    print(f"Combined dataset saved to {output_path}")
+        logger.info(f"Found {len(cached_files)} cached Zarr files")
 
+        sample_datasets = []
+        for zarr_file in cached_files:
+            try:
+                logger.info(f"Loading {zarr_file.name}...")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Process BAM files and create xarray Dataset."
-    )
-    parser.add_argument(
-        "--bam-file", help="Path to a single BAM file to process and cache."
-    )
-    parser.add_argument(
-        "--cache-dir", required=True, help="Directory to store cached Zarr files."
-    )
-    parser.add_argument("--contig", required=True, help="Chromosome/contig name.")
-    parser.add_argument(
-        "--chrom-size", type=int, required=True, help="Size of the chromosome/contig."
-    )
-    parser.add_argument(
-        "--process-bam",
-        action="store_true",
-        help="Process and cache a single BAM file.",
-    )
-    parser.add_argument(
-        "--combine-datasets",
-        action="store_true",
-        help="Combine cached Zarr files into a final dataset.",
-    )
-    parser.add_argument("--metadata-path", help="Path to metadata CSV file.")
-    parser.add_argument("--output-path", help="Path to save the combined Zarr dataset.")
+                # Open root to get chromosome groups
+                root = zarr.open_group(zarr_file, mode="r")
+                chromosomes = sorted(root.group_keys())
 
-    args = parser.parse_args()
+                logger.info(f"  Found {len(chromosomes)} chromosome groups")
 
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+                # Load each chromosome group
+                chrom_datasets = []
+                for chrom in chromosomes:
+                    ds_chrom = xr.open_zarr(zarr_file, group=chrom)
+                    chrom_datasets.append(ds_chrom)
 
-    if args.process_bam and args.bam_file:
-        # Process and cache a single BAM file
-        process_and_cache_bam(args.bam_file, args.contig, args.chrom_size, cache_dir)
+                # Combine chromosomes for this sample
+                logger.info(f"  Combining chromosomes for {zarr_file.stem}...")
+                sample_ds = xr.concat(chrom_datasets, dim="chromosome", join="outer")
+                sample_ds = sample_ds.assign_coords(chromosome=chromosomes)
 
-    if args.combine_datasets:
-        # Combine cached Zarr files into a final dataset
-        if not args.metadata_path or not args.output_path:
-            raise ValueError(
-                "--metadata-path and --output-path are required for combining datasets."
-            )
+                # Copy metadata from root attrs
+                for key, value in root.attrs.items():
+                    if key not in ["chromosomes"]:  # Skip chromosome list
+                        sample_ds.attrs[key] = value
 
-        metadata_df = pd.read_csv(args.metadata_path)
-        combine_cached_zarrs(cache_dir, metadata_df, Path(args.output_path))
+                sample_datasets.append(sample_ds)
 
+            except Exception as e:
+                logger.warning(f"Failed to load {zarr_file}: {e}")
 
-if __name__ == "__main__":
-    main()
+        if not sample_datasets:
+            raise ValueError("No valid zarr datasets could be loaded")
+
+        logger.info(f"Loaded {len(sample_datasets)} sample datasets")
+
+        # Combine datasets along the "sample" dimension
+        logger.info("Combining all samples along 'sample' dimension...")
+        combined_ds = xr.concat(sample_datasets, dim="sample", join="outer")
+        logger.info("Combined datasets along 'sample' dimension")
+
+        # Add sample names as coordinates
+        sample_names = [f.stem for f in cached_files]
+        combined_ds = combined_ds.assign_coords(sample=sample_names)
+
+        # Add metadata
+        logger.info(f"Adding metadata from {len(metadata_df)} rows")
+        for col in metadata_df.columns:
+            if col != "sample_id":
+                combined_ds.coords[col] = ("sample", metadata_df[col].values)
+
+        # Save combined dataset
+        logger.info(f"Saving combined dataset to {output_path}")
+        encoding = {
+            "signal": {"chunks": (1, 1, 100_000)}
+        }  # (sample, chromosome, position)
+        combined_ds.to_zarr(
+            output_path, mode="w", encoding=encoding, consolidated=False
+        )
+        logger.info(f"Combined dataset saved successfully to {output_path}")
+
+    except Exception as e:
+        logger.error(f"Error combining zarr files: {e}")
+        raise

@@ -1,5 +1,6 @@
 import os
 import warnings
+
 os.environ["KMP_WARNINGS"] = "0"
 os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -12,11 +13,14 @@ import sys
 import traceback
 from pathlib import Path
 
+import pandas as pd
 from loguru import logger
+
 
 from QuantNado.call_quantile_peaks import call_peaks_from_bigwig_dir
 from QuantNado.make_dataset import make_dataset
-from QuantNado.make_zarr_store import combine_cached_zarrs, process_and_cache_bam
+from QuantNado.make_zarr_store import combine_cached_zarrs, process_bam
+from QuantNado.combine_metadata import combine_metadata_files, find_metadata_files
 
 
 def call_peaks_main():
@@ -184,15 +188,14 @@ def make_zarr_main():
         help="Directory to store cached Zarr files.",
     )
     parser.add_argument(
-        "--contig",
-        required=True,
-        help="Chromosome/contig name.",
+        "--chromsizes",
+        help="Path to a two-column chromsizes file (chromosome, size).",
     )
     parser.add_argument(
-        "--chrom-size",
+        "--max-workers",
         type=int,
-        required=True,
-        help="Size of the chromosome/contig.",
+        default=4,
+        help="Number of parallel threads for processing chromosomes (default: 4).",
     )
     parser.add_argument(
         "--combine",
@@ -207,15 +210,32 @@ def make_zarr_main():
         "--output-path",
         help="Path to save the combined Zarr dataset.",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=Path("quantnado_processing.log"),
+        help="Path to the log file (default: quantnado_processing.log).",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
 
+    if args.log_file.parent != Path(".") and not args.log_file.parent.exists():
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Don't delete the log file - append to it across multiple runs
+    _setup_logging(args.log_file, args.verbose)
+
     if args.bam_file:
-        process_and_cache_bam(
+        if not args.chromsizes:
+            raise ValueError("--chromsizes is required when processing BAM files.")
+
+        logger.info(f"Processing {args.bam_file} for all chromosomes")
+        process_bam(
             bam_file=args.bam_file,
-            contig=args.contig,
-            chrom_size=args.chrom_size,
+            chromsizes=args.chromsizes,
             cache_dir=args.cache_dir,
+            max_workers=args.max_workers,
         )
 
     if args.combine:
@@ -224,20 +244,77 @@ def make_zarr_main():
                 "--metadata-path and --output-path are required for combining datasets."
             )
 
-        import pandas as pd
-
         metadata_df = pd.read_csv(args.metadata_path)
         combine_cached_zarrs(
             cache_dir=args.cache_dir,
             metadata_df=metadata_df,
-            output_path=args.output_path,
+            output_path=Path(args.output_path),
         )
 
-    print("Zarr processing complete.")
+    logger.success("Zarr processing complete.")
+
+
+def combine_metadata_main():
+    """CLI entry point for combining metadata files."""
+    parser = argparse.ArgumentParser(
+        description="Combine metadata CSV files from different assays."
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        help="Directory containing metadata_*.csv files to combine.",
+    )
+    parser.add_argument(
+        "--metadata-files",
+        nargs="+",
+        type=Path,
+        help="Specific metadata CSV files to combine (alternative to --data-dir).",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        required=True,
+        help="Path to save the combined metadata CSV file.",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=Path("quantnado_metadata.log"),
+        help="Path to the log file (default: quantnado_metadata.log).",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.log_file.parent != Path(".") and not args.log_file.parent.exists():
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.log_file.exists():
+        args.log_file.unlink()
+
+    _setup_logging(args.log_file, args.verbose)
+
+    # Determine which metadata files to combine
+    if args.data_dir:
+        metadata_files = find_metadata_files(args.data_dir)
+    elif args.metadata_files:
+        metadata_files = args.metadata_files
+    else:
+        raise ValueError("Either --data-dir or --metadata-files must be provided.")
+
+    # Combine metadata files
+    combined_df = combine_metadata_files(
+        metadata_files=metadata_files,
+        output_path=args.output_path,
+    )
+
+    logger.info("Metadata combining complete.")
+    print(f"Combined metadata saved to {args.output_path}")
+    print(f"Total samples: {len(combined_df)}")
 
 
 def _setup_logging(log_path: Path, verbose: bool):
     logger.remove()
     log_format = "{time:YYYY-MM-DD HH:mm:ss} [{level}] {message}"
-    logger.add(log_path, level="DEBUG", format=log_format)
+    logger.add(log_path, level="DEBUG", format=log_format, mode="a")
     logger.add(sys.stderr, level="DEBUG" if verbose else "INFO", format=log_format)

@@ -44,6 +44,7 @@ quantnado-call-peaks = "QuantNado.cli:call_peaks_main"
 quantnado-make-dataset = "QuantNado.cli:make_dataset_main"
 quantnado-make-xarray = "QuantNado.cli:make_xarray_main"
 quantnado-make-zarr = "QuantNado.cli:make_zarr_main"
+quantnado-combine-metadata = "QuantNado.cli:combine_metadata_main"
 
 [tool.setuptools_scm]
 write_to = "QuantNado/_version.py"
