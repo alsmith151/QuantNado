@@ -12,3 +12,4 @@ my_test/
 notebooks/
 QuantNado.egg-info/
 QuantNado/_version.py
+example/*.log

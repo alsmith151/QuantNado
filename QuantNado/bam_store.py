@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Literal
+from typing import Any, Iterable, Literal, Sequence
 
 import bamnado
 import dask.array as da
@@ -12,6 +12,9 @@ import pandas as pd
 import sparse
 import xarray as xr
 from loguru import logger
+from numcodecs import Blosc
+
+DEFAULT_CHUNK_LEN = 65536
 
 
 class StorageBackend(ABC):
@@ -57,6 +60,11 @@ class StorageBackend(ABC):
         """Delete the store."""
         pass
 
+    @abstractmethod
+    def write_update(self, data: xr.Dataset, store_path: Path) -> None:
+        """Persist updates to an existing store without changing its structure."""
+        pass
+
 
 class ZarrBackend(StorageBackend):
     """Zarr storage backend."""
@@ -73,6 +81,7 @@ class ZarrBackend(StorageBackend):
             mode="w",
             encoding=encoding,
             consolidated=False,
+            zarr_format=3,
         )
         logger.debug(f"Created Zarr store at {store_path}")
 
@@ -88,6 +97,7 @@ class ZarrBackend(StorageBackend):
             mode="a",
             append_dim=append_dim,
             consolidated=False,
+            zarr_format=3,
         )
 
     def open(self, store_path: Path) -> xr.Dataset:
@@ -103,15 +113,25 @@ class ZarrBackend(StorageBackend):
 
     def exists(self, store_path: Path) -> bool:
         """Check if Zarr store exists."""
-        return store_path.exists() and (store_path / ".zgroup").exists()
+        if not store_path.exists():
+            return False
+        # Zarr v2 has .zgroup, v3 has zarr.json
+        return (store_path / ".zgroup").exists() or (store_path / "zarr.json").exists()
 
     def delete(self, store_path: Path) -> None:
         """Delete the Zarr store."""
         import shutil
 
-        if self.exists(store_path):
-            shutil.rmtree(store_path)
+        if store_path.exists():
+            if store_path.is_dir():
+                shutil.rmtree(store_path)
+            else:
+                store_path.unlink()
             logger.debug(f"Deleted Zarr store at {store_path}")
+
+    def write_update(self, data: xr.Dataset, store_path: Path) -> None:
+        """Write updates to an existing Zarr store."""
+        data.to_zarr(store_path, mode="a", consolidated=False, zarr_format=3)
 
 
 class HDF5Backend(StorageBackend):
@@ -164,6 +184,10 @@ class HDF5Backend(StorageBackend):
             store_path.unlink()
             logger.debug(f"Deleted HDF5 store at {store_path}")
 
+    def write_update(self, data: xr.Dataset, store_path: Path) -> None:
+        """Persist updates to an existing HDF5/NetCDF store."""
+        data.to_netcdf(store_path, mode="a", format="NETCDF4")
+
 
 BackendType = Literal["zarr", "hdf5", "netcdf4"]
 
@@ -207,12 +231,24 @@ class BamStore:
         self._is_initialized = False
         self._sample_count = 0
 
+        # ensure extension for backend
+        suffix_map = {"zarr": ".zarr", "hdf5": ".h5", "netcdf4": ".nc"}
+        expected_suffix = suffix_map[backend]
+        if not str(self.store_path).endswith(expected_suffix):
+            current_suffix = self.store_path.suffix
+            if current_suffix:
+                logger.info(
+                    f"Replacing store suffix '{current_suffix}' with '{expected_suffix}' for backend '{backend}'"
+                )
+            self.store_path = self.store_path.with_suffix(expected_suffix)
+        logger.debug(f"Using backend '{backend}' with store path: {self.store_path}")
+
         # Handle existing store
-        if self._backend.exists(self.store_path):
+        if self.store_path.exists():
             if overwrite:
                 logger.warning(f"Deleting existing store at: {self.store_path}")
                 self._backend.delete(self.store_path)
-            else:
+            elif self._backend.exists(self.store_path):
                 logger.info(f"Resuming with existing store: {self.store_path}")
                 # Load existing dataset to get sample count
                 try:
@@ -222,6 +258,11 @@ class BamStore:
                     logger.info(f"Found {self._sample_count} existing samples")
                 except Exception as e:
                     logger.warning(f"Could not read existing store: {e}")
+            else:
+                logger.warning(
+                    f"Path {self.store_path} exists but is not a valid '{backend}' store; "
+                    "set overwrite=True to recreate"
+                )
 
     @staticmethod
     def _get_backend(backend_type: BackendType) -> StorageBackend:
@@ -237,8 +278,15 @@ class BamStore:
             )
 
     @staticmethod
+    def _to_str_list(values: Iterable[Any]) -> list[str]:
+        """Coerce values to a list of strings for JSON-safe attribute storage."""
+        arr_obj = np.asarray(list(values), dtype=object)
+        return ["" if (pd.isna(v) or v is None) else str(v) for v in arr_obj]
+
+    @staticmethod
     def _parse_chromsizes(
-        chromsizes: str | Path | dict[str, int], filter_chromosomes: bool = True
+        chromsizes: str | Path | dict[str, int], filter_chromosomes: bool = True,
+        test: bool = False
     ) -> dict[str, int]:
         """
         Parse chromosome sizes from file or dict.
@@ -284,6 +332,13 @@ class BamStore:
                 else:
                     chromsizes_dict[chrom] = size
 
+        if test:
+            desired = ["chr21", "chr22", "chrY"]
+            chromsizes_dict = {c: chromsizes_dict[c] for c in desired if c in chromsizes_dict}
+            logger.info(
+                f"Test mode enabled: keeping chromosomes {list(chromsizes_dict.keys())}"
+            )
+
         logger.info(f"Loaded {len(chromsizes_dict)} chromosomes from {chromsizes}")
         return chromsizes_dict
 
@@ -304,6 +359,11 @@ class BamStore:
         - xarray Dataset
         """
         store_path = Path(store_path)
+        # Normalize suffix for backend
+        suffix_map = {"zarr": ".zarr", "hdf5": ".h5", "netcdf4": ".nc"}
+        expected_suffix = suffix_map[backend]
+        if not str(store_path).endswith(expected_suffix):
+            store_path = store_path.with_suffix(expected_suffix)
         backend_obj = cls._get_backend(backend)
 
         if not backend_obj.exists(store_path):
@@ -315,7 +375,7 @@ class BamStore:
     @staticmethod
     def _process_chromosome(
         bam_file: str, contig: str, contig_size: int
-    ) -> tuple[str, xr.Dataset, float]:
+    ) -> tuple[str, sparse.COO, float]:
         """
         Process a single chromosome from a BAM file.
 
@@ -326,7 +386,7 @@ class BamStore:
 
         Returns:
         - contig: Chromosome name
-        - ds_chrom: xarray Dataset with signal data
+        - data: Sparse coverage array for the contig
         - sparsity: Percentage of zero values
         """
         # Constants for bamnado
@@ -344,6 +404,18 @@ class BamStore:
             ignore_scaffold_chromosomes=False,
         )
 
+        # Align signal length to declared contig size to keep coords/data consistent
+        actual_len = signal.shape[0]
+        if actual_len != contig_size:
+            logger.warning(
+                f"Signal length for {contig} differs from chromsizes ({actual_len} vs {contig_size}); aligning to declared size"
+            )
+            if actual_len > contig_size:
+                signal = signal[:contig_size]
+            else:
+                pad_width = contig_size - actual_len
+                signal = np.pad(signal, (0, pad_width), mode="constant")
+
         # Detect optimal dtype based on max value
         max_val = signal.max()
         if max_val <= np.iinfo(np.uint16).max:
@@ -358,25 +430,18 @@ class BamStore:
 
         # Calculate sparsity
         sparsity = (np.sum(data == 0) / data.size) * 100
-
-        # Create sparse array and xarray Dataset
-        sparse_data = sparse.COO.from_numpy(data)
-        ds_chrom = xr.Dataset(
-            {"signal": (["position"], sparse_data)},
-            coords={
-                "position": np.arange(contig_size, dtype="int32"),
-                "chromosome": contig,
-            },
+        data_sparse = sparse.COO.from_numpy(data)
+        logger.debug(
+            f"Processed {contig}: length={contig_size}, dtype={dtype}, sparsity={sparsity:.2f}%"
         )
-
-        return contig, ds_chrom, sparsity
+        return contig, data_sparse, sparsity
 
     def _process_bam_file(
         self,
         bam_file: str,
         chromsizes_dict: dict[str, int],
         max_workers: int = 1,
-    ) -> tuple[dict[str, np.ndarray], list[float]]:
+    ) -> tuple[dict[str, sparse.COO], list[float]]:
         """
         Process all chromosomes for a single BAM file in parallel.
 
@@ -386,7 +451,7 @@ class BamStore:
         - max_workers: Number of parallel threads for processing chromosomes
 
         Returns:
-        - sample_data: Dictionary mapping chromosome names to signal arrays
+        - sample_data: Dictionary mapping chromosome names to sparse signal arrays
         - sparsity_values: List of sparsity percentages for each chromosome
         """
         sample_data = {}
@@ -403,9 +468,7 @@ class BamStore:
             for future in as_completed(future_to_contig):
                 contig = future_to_contig[future]
                 try:
-                    contig_name, ds_chrom, sparsity = future.result()
-                    # Extract sparse data properly
-                    signal_data = ds_chrom["signal"].data
+                    contig_name, signal_data, sparsity = future.result()
                     sample_data[contig_name] = signal_data
                     sparsity_values.append(sparsity)
                 except Exception as e:
@@ -419,76 +482,56 @@ class BamStore:
         sample_data: dict[str, sparse.COO],
         sample_name: str,
         chromosomes: list[str],
-        chromsizes_dict: dict[str, int],
+        contig_lengths: list[int],
+        contig_offsets: list[int],
+        chunk_len: int = DEFAULT_CHUNK_LEN,
     ) -> None:
         """
-        Write a single sample to the store.
+        Write a single sample to the store, with each chromosome as a separate variable (sample x position).
 
         Parameters:
         - sample_data: Dictionary mapping chromosome names to sparse coverage arrays
         - sample_name: Name of the sample
         - chromosomes: Ordered list of chromosome names
-        - chromsizes_dict: Dictionary mapping chromosome names to sizes
+        - contig_lengths: List of contig lengths matching `chromosomes`
+        - contig_offsets: Cumulative offsets for each contig start in the flat axis
+        - chunk_len: Chunk length for the flattened position axis
         """
-        # Determine max chromosome length for padding
-        max_chrom_size = max(chromsizes_dict[chrom] for chrom in chromosomes)
+        # Create a flattened dataset with contig offsets and a single signal variable
+        total_length = sum(contig_lengths)
+        coords = {
+            "sample": np.array([self._sample_count], dtype="int64"),
+            "position_flat": np.arange(total_length, dtype="int64"),
+            "contig": np.arange(len(chromosomes), dtype="int64"),
+            "contig_length": ("contig", np.array(contig_lengths, dtype="int64")),
+            "contig_offset": ("contig", np.array(contig_offsets, dtype="int64")),
+        }
 
-        # Determine dtype from one chromosome (sparse arrays have dtype attribute)
-        first_chrom = chromosomes[0]
-        dtype = sample_data[first_chrom].dtype
-
-        # Stack sparse arrays with padding - build list of padded sparse rows
-        sparse_rows = []
-        for chrom in chromosomes:
+        # Build flattened signal per sample using dask; densify per contig chunk to keep memory bounded
+        contig_arrays = []
+        for chrom, chrom_len in zip(chromosomes, contig_lengths):
             chrom_data_sparse = sample_data[chrom]
-            chrom_len = chromsizes_dict[chrom]
+            if not isinstance(chrom_data_sparse, sparse.COO):
+                chrom_data_sparse = sparse.COO.from_numpy(chrom_data_sparse)
+                logger.debug(f"Converted chromosome '{chrom}' data to sparse.COO")
+            chrom_dense = np.asarray(chrom_data_sparse.todense(), order="C")
+            chunk = max(1, min(chrom_len, chunk_len))
+            contig_arrays.append(da.from_array(chrom_dense, chunks=(chunk,)))
 
-            # Pad sparse array to max_chrom_size if needed
-            if chrom_len < max_chrom_size:
-                # Create padded sparse array by converting to dense temporarily
-                # (only for the padding step, individual chromosomes are small enough)
-                padded = np.zeros(max_chrom_size, dtype=dtype)
-                padded[:chrom_len] = chrom_data_sparse.todense()
-                sparse_rows.append(sparse.COO.from_numpy(padded))
-            else:
-                sparse_rows.append(chrom_data_sparse)
+        signal_flat = da.concatenate(contig_arrays, axis=0)
+        signal_flat = signal_flat.rechunk((chunk_len,))
+        data_vars = {"signal": (["sample", "position_flat"], signal_flat[None, :])}
 
-        # Stack sparse arrays efficiently (creates 2D array: chromosomes × position)
-        data_2d = sparse.stack(sparse_rows)
+        dtype_str = np.dtype(signal_flat.dtype).name
 
-        # Wrap sparse array in dask for lazy evaluation and efficient chunking
-        # Chunks: (1 chromosome, 1M positions) for efficient zarr storage
-        dask_array = da.from_array(
-            data_2d,
-            chunks=(1, 1_000_000),
-            asarray=False,  # Keep as sparse
-        )
-
-        # Add sample dimension by expanding to 3D (1 × chromosomes × position)
-        dask_array_3d = dask_array[None, :, :]
-
-        # Create Dataset with dask-wrapped sparse data
-        ds_sample = xr.Dataset(
-            {
-                "signal": (
-                    ["sample", "chromosome", "position"],
-                    dask_array_3d,
-                )
-            },
-            coords={
-                "sample": np.array([str(sample_name)], dtype="object"),
-                "chromosome": np.array([str(c) for c in chromosomes], dtype="object"),
-                "position": np.arange(max_chrom_size, dtype="int32"),
-            },
-        )
-
-        # Encoding for efficient storage
         encoding = {
             "signal": {
-                "chunks": (1, 1, 1_000_000),
-                "dtype": str(dtype),
+                "chunks": (1, signal_flat.chunksize[0]),
+                "dtype": dtype_str,
             }
         }
+
+        ds_sample = xr.Dataset(data_vars, coords=coords)
 
         if not self._is_initialized:
             # First sample - create store
@@ -576,7 +619,9 @@ class BamStore:
         overwrite: bool = True,
         sample_column: str = "sample_id",
         backend: BackendType = "zarr",
+        chunk_len: int = DEFAULT_CHUNK_LEN,
         log_file: Path | None = None,
+        test: bool = False,
     ) -> "BamStore":
         """
         Create a BamStore from BAM files with metadata.
@@ -597,7 +642,8 @@ class BamStore:
         - max_workers: Number of parallel threads for chromosome processing
         - overwrite: If True, overwrite existing store
         - sample_column: Column name in metadata containing sample identifiers
-        - backend: Storage backend ('zarr', 'hdf5', 'netcdf4')
+        - backend: Storage backend ('zarr' only for ragged layout)
+        - chunk_len: Chunk length for flattened position axis
         - log_file: Optional path to log file. If None, logging is not configured.
 
         Returns:
@@ -622,20 +668,41 @@ class BamStore:
 
         # Ensure standard dtypes for all columns
         for col in metadata.columns:
-            values = metadata[col].values
-            if np.issubdtype(values.dtype, np.str_) or values.dtype == object:
-                metadata[col] = metadata[col].astype(str)
-            elif pd.api.types.is_integer_dtype(values):
-                metadata[col] = metadata[col].astype(int)
-            elif pd.api.types.is_float_dtype(values):
-                metadata[col] = metadata[col].astype(float)
+            series = metadata[col]
+            if np.issubdtype(series.dtype, np.str_) or series.dtype == object:
+                metadata[col] = series.astype(str)
+                continue
+            if pd.api.types.is_integer_dtype(series):
+                numeric = pd.to_numeric(series, errors="coerce", downcast="integer")
+                if numeric.isna().any():
+                    metadata[col] = numeric.astype("Int64")
+                else:
+                    metadata[col] = numeric.astype(int)
+                continue
+            if pd.api.types.is_float_dtype(series):
+                metadata[col] = pd.to_numeric(series, errors="coerce")
 
         logger.info(
             f"Processing {len(bam_files)} BAM files into unified dataset: '{store_path}'"
         )
 
+        # Enforce ragged path on zarr backend
+        if backend != "zarr":
+            raise ValueError(
+                "Ragged assay×sample×contig×position layout is supported only for backend='zarr'"
+            )
+
         # Parse chromsizes
-        chromsizes_dict = cls._parse_chromsizes(chromsizes, filter_chromosomes)
+        chromsizes_dict = cls._parse_chromsizes(chromsizes, filter_chromosomes, test=test)
+
+        # Prepare contig order/lengths and offsets for ragged flattening
+        chromosomes = list(chromsizes_dict.keys())
+        contig_lengths = [chromsizes_dict[c] for c in chromosomes]
+        contig_offsets = np.cumsum([0] + contig_lengths[:-1]).tolist()
+        total_positions = sum(contig_lengths)
+        logger.info(
+            f"Ragged layout: {len(chromosomes)} contigs, total positions {total_positions:,}, chunk_len={chunk_len}"
+        )
 
         # Initialize store
         store = cls(store_path, backend=backend, overwrite=overwrite)
@@ -654,7 +721,7 @@ class BamStore:
 
         # Extract sample names from BAM files
         sample_id = [Path(f).stem for f in bam_files]
-        chromosomes = list(chromsizes_dict.keys())
+        store._sample_bytes_width = max(1, max(len(str(s)) for s in sample_id)) if sample_id else 1
 
         # Group samples by assay and track metadata name mapping
         assay_groups = {}
@@ -675,19 +742,25 @@ class BamStore:
                     # For ChIP samples, verify suffix matches either IP or control
                     assay = sample_metadata["assay"].values[0]
                     if assay == "ChIP" or assay == "CUT&Tag":
-                        ip_value = sample_metadata["ip"].values[0]
-                        control_value = sample_metadata["control"].values[0]
+                        if {"ip", "control"}.issubset(sample_metadata.columns):
+                            ip_value = sample_metadata["ip"].values[0]
+                            control_value = sample_metadata["control"].values[0]
 
-                        if (
-                            suffix.lower() == str(ip_value).lower()
-                            or suffix.lower() == str(control_value).lower()
-                        ):
-                            metadata_sample_name = base_name
+                            if (
+                                suffix.lower() == str(ip_value).lower()
+                                or suffix.lower() == str(control_value).lower()
+                            ):
+                                metadata_sample_name = base_name
+                            else:
+                                logger.warning(
+                                    f"Sample '{sample_name}' suffix '{suffix}' doesn't match IP '{ip_value}' or control '{control_value}'"
+                                )
+                                sample_metadata = pd.DataFrame()
                         else:
                             logger.warning(
-                                f"Sample '{sample_name}' suffix '{suffix}' doesn't match IP '{ip_value}' or control '{control_value}'"
+                                f"Metadata for assay '{assay}' missing 'ip'/'control' columns; accepting base match for '{sample_name}'"
                             )
-                            sample_metadata = pd.DataFrame()
+                            metadata_sample_name = base_name
                     else:
                         logger.info(
                             f"Matched '{sample_name}' to metadata entry '{base_name}'"
@@ -695,10 +768,9 @@ class BamStore:
                         metadata_sample_name = base_name
 
             if sample_metadata.empty:
-                logger.warning(
-                    f"Sample '{sample_name}' not found in metadata, skipping"
+                raise ValueError(
+                    f"Sample '{sample_name}' not found in metadata; aborting to avoid silent drops"
                 )
-                continue
 
             assay = sample_metadata["assay"].values[0]
             if assay not in assay_groups:
@@ -752,7 +824,9 @@ class BamStore:
                     sample_data=sample_data,
                     sample_name=sample_name,
                     chromosomes=chromosomes,
-                    chromsizes_dict=chromsizes_dict,
+                    contig_lengths=contig_lengths,
+                    contig_offsets=contig_offsets,
+                    chunk_len=chunk_len,
                 )
                 processed_samples.append(sample_name)
 
@@ -760,15 +834,14 @@ class BamStore:
         logger.info("Adding metadata and global attributes...")
         ds_final = store.dataset
 
-        # Add assay as a coordinate along the sample dimension
+        # Store assay per sample as attribute (JSON-safe strings)
         assay_coord = []
         for sample_name in processed_samples:
             for assay_name, assay_data in assay_groups.items():
                 if sample_name in assay_data["sample_id"]:
                     assay_coord.append(assay_name)
                     break
-
-        ds_final = ds_final.assign_coords(assay=("sample", assay_coord))
+        ds_final.attrs["assay_by_sample"] = cls._to_str_list(assay_coord)
 
         # Add other metadata columns as coordinates
         for col in metadata.columns:
@@ -783,20 +856,30 @@ class BamStore:
                         metadata_values.append(sample_row[col].values[0])
                     else:
                         metadata_values.append(np.nan)
-                ds_final = ds_final.assign_coords({col: ("sample", metadata_values)})
+                if metadata[col].dtype == object or np.issubdtype(metadata[col].dtype, np.str_):
+                    ds_final.attrs[f"metadata_{col}"] = cls._to_str_list(metadata_values)
+                else:
+                    ds_final.attrs[f"metadata_{col}"] = [
+                        None if pd.isna(v) else v for v in metadata_values
+                    ]
 
         # Add global attributes
         assay_names = list(assay_groups.keys())
         ds_final.attrs["description"] = (
-            "BAM coverage data across all samples and chromosomes (flattened structure)"
+            "BAM coverage data stored as ragged flattened signal with contig offsets"
         )
         ds_final.attrs["num_assays"] = len(assay_names)
         ds_final.attrs["num_samples_total"] = total_samples
-        ds_final.attrs["num_chromosomes"] = len(chromosomes)
+        ds_final.attrs["num_contigs"] = len(chromosomes)
         ds_final.attrs["assays"] = ",".join(assay_names)
-        ds_final.attrs["structure"] = "flattened (sample × chromosome × position)"
+        ds_final.attrs["sample_names"] = cls._to_str_list(processed_samples)
+        ds_final.attrs["contig_names"] = cls._to_str_list(chromosomes)
+        ds_final.attrs["structure"] = (
+            "ragged (sample × position_flat with contig offsets)"
+        )
+        ds_final.attrs["bin_size"] = 1
 
-        ds_final.to_zarr(store.store_path, mode="a", consolidated=False)
+        store._backend.write_update(ds_final, store.store_path)
 
         # Finalize the store
         store.finalize(sparsity_values=sparsity_values)
@@ -836,27 +919,36 @@ class BamStore:
                 f"Available columns: {list(metadata.columns)}"
             )
 
-        metadata = metadata.set_index(sample_col).loc[sample_id].reset_index()
+        metadata = metadata.set_index(sample_col)
+        missing_samples = [s for s in sample_id if s not in metadata.index]
+        if missing_samples:
+            raise ValueError(
+                f"Metadata missing {len(missing_samples)} sample(s): {missing_samples}"
+            )
+        extra_samples = [s for s in metadata.index if s not in sample_id]
+        if extra_samples:
+            logger.warning(
+                f"Metadata contains {len(extra_samples)} unused sample(s): {extra_samples}"
+            )
+        metadata = metadata.reindex(sample_id).reset_index()
 
-        # Add metadata columns as coordinates
+        # Add metadata columns as attributes (JSON-safe)
         for col in metadata.columns:
             if col != sample_col:
                 values = metadata[col].values
-                # Convert to standard dtypes
                 if values.dtype == object or np.issubdtype(values.dtype, np.str_):
-                    values = values.astype(str)
+                    ds.attrs[f"metadata_{col}"] = self._to_str_list(values)
                 elif pd.api.types.is_integer_dtype(values):
-                    values = values.astype(int)
+                    ds.attrs[f"metadata_{col}"] = [int(v) if not pd.isna(v) else None for v in values]
                 elif pd.api.types.is_float_dtype(values):
-                    values = values.astype(float)
-                ds = ds.assign_coords({col: ("sample", values)})
+                    ds.attrs[f"metadata_{col}"] = [float(v) if not pd.isna(v) else None for v in values]
 
         # Add global attributes
         ds.attrs["num_samples"] = len(sample_id)
-        ds.attrs["num_chromosomes"] = len(ds.chromosome)
+        ds.attrs["num_contigs"] = len(ds.contig)
 
         # Write back to store
-        ds.to_zarr(self.store_path, mode="a", consolidated=False)
+        self._backend.write_update(ds, self.store_path)
         logger.info("Metadata added successfully")
 
     def finalize(self, sparsity_values: list[float] | None = None) -> None:
@@ -873,7 +965,7 @@ class BamStore:
             # Add sparsity to attributes
             ds = self._backend.open(self.store_path)
             ds.attrs["average_sparsity"] = f"{avg_sparsity:.2f}%"
-            ds.to_zarr(self.store_path, mode="a", consolidated=False)
+            self._backend.write_update(ds, self.store_path)
 
         # Backend-specific finalization
         self._backend.finalize(self.store_path)
