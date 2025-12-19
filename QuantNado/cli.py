@@ -16,11 +16,10 @@ from pathlib import Path
 import pandas as pd
 from loguru import logger
 
-
+from QuantNado.bam_store import BamStore
 from QuantNado.call_quantile_peaks import call_peaks_from_bigwig_dir
 from QuantNado.make_dataset import make_dataset
-from QuantNado.make_zarr_store import bams_to_zarr
-from QuantNado.combine_metadata import combine_metadata_files, find_metadata_files
+from QuantNado.utils import setup_logging
 
 
 def call_peaks_main():
@@ -85,7 +84,7 @@ def call_peaks_main():
     if args.log_file.exists():
         args.log_file.unlink()
 
-    _setup_logging(args.log_file, args.verbose)
+    setup_logging(args.log_file, args.verbose)
 
     try:
         call_peaks_from_bigwig_dir(
@@ -154,7 +153,7 @@ def make_dataset_main():
     if args.log_file.exists():
         args.log_file.unlink()
 
-    _setup_logging(args.log_file, args.verbose)
+    setup_logging(args.log_file, args.verbose)
 
     try:
         make_dataset(
@@ -218,88 +217,20 @@ def make_zarr_main():
     if args.log_file.parent != Path(".") and not args.log_file.parent.exists():
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    _setup_logging(args.log_file, args.verbose)
-
-    # Load metadata if provided
-    metadata_df = None
-    if args.metadata_path:
-        logger.info(f"Loading metadata from {args.metadata_path}")
-        metadata_df = pd.read_csv(args.metadata_path)
-
     # Process all BAM files into unified Zarr dataset
+    if not args.metadata_path:
+        logger.error("--metadata-path is required")
+        sys.exit(1)
+
     logger.info(f"Processing {len(args.bam_files)} BAM files into {args.output_path}")
-    bams_to_zarr(
+    BamStore.from_bam_files(
         bam_files=args.bam_files,
         chromsizes=args.chromsizes,
-        main_store_path=args.output_path,
+        store_path=args.output_path,
+        metadata=args.metadata_path,
         max_workers=args.max_workers,
-        metadata_df=metadata_df,
+        log_file=args.log_file,
     )
 
     logger.success(f"Zarr dataset created: {args.output_path}")
-
-
-def combine_metadata_main():
-    """CLI entry point for combining metadata files."""
-    parser = argparse.ArgumentParser(
-        description="Combine metadata CSV files from different assays."
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        help="Directory containing metadata_*.csv files to combine.",
-    )
-    parser.add_argument(
-        "--metadata-files",
-        nargs="+",
-        type=Path,
-        help="Specific metadata CSV files to combine (alternative to --data-dir).",
-    )
-    parser.add_argument(
-        "--output-path",
-        type=Path,
-        required=True,
-        help="Path to save the combined metadata CSV file.",
-    )
-    parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=Path("quantnado_metadata.log"),
-        help="Path to the log file (default: quantnado_metadata.log).",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true")
-
-    args = parser.parse_args()
-
-    if args.log_file.parent != Path(".") and not args.log_file.parent.exists():
-        args.log_file.parent.mkdir(parents=True, exist_ok=True)
-
-    if args.log_file.exists():
-        args.log_file.unlink()
-
-    _setup_logging(args.log_file, args.verbose)
-
-    # Determine which metadata files to combine
-    if args.data_dir:
-        metadata_files = find_metadata_files(args.data_dir)
-    elif args.metadata_files:
-        metadata_files = args.metadata_files
-    else:
-        raise ValueError("Either --data-dir or --metadata-files must be provided.")
-
-    # Combine metadata files
-    combined_df = combine_metadata_files(
-        metadata_files=metadata_files,
-        output_path=args.output_path,
-    )
-
-    logger.info("Metadata combining complete.")
-    print(f"Combined metadata saved to {args.output_path}")
-    print(f"Total samples: {len(combined_df)}")
-
-
-def _setup_logging(log_path: Path, verbose: bool):
-    logger.remove()
-    log_format = "{time:YYYY-MM-DD HH:mm:ss} [{level}] {message}"
-    logger.add(log_path, level="DEBUG", format=log_format, mode="a")
-    logger.add(sys.stderr, level="DEBUG" if verbose else "INFO", format=log_format)
+    sys.exit(0)

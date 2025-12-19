@@ -4,6 +4,7 @@ channels:
   - bioconda
   - defaults
 dependencies:
+  - python=3.11.13
   - anndata=0.12.6
   - bokeh=3.8.1
   - click=8.2.1
@@ -15,11 +16,11 @@ dependencies:
   - ipywidgets=8.1.8
   - jupyter_bokeh=4.0.5
   - loguru=0.7.3
-  - matplotlib=3.10.3
+  - matplotlib
   - numba=0.61.2
   - numpy=2.0.1
   - pandas=2.3.0
-  - python=3.11.13
+  - pip
   - scikit-learn=1.7.0
   - scipy=1.15.3
   - seaborn=0.13.2
@@ -30,3 +31,4 @@ dependencies:
   - pip:
     - crested==1.5.0
     - pysam==0.23.3
+    - bamnado==0.4.0

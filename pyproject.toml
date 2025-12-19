@@ -18,6 +18,7 @@ license = "MIT"
 dynamic = ["version"]
 
 dependencies = [
+    "bamnado",
     "crested",
     "loguru",
     "numpy",

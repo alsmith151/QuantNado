@@ -6,7 +6,7 @@
 *.zarr
 data/
 epiquant/
-example/
+example/combined_metadata.csv
 logs/
 my_test/
 notebooks/
