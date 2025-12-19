@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import bamnado
+import dask.array as da
 import numpy as np
 import pandas as pd
 import sparse
@@ -96,6 +97,7 @@ class ZarrBackend(StorageBackend):
     def finalize(self, store_path: Path) -> None:
         """Consolidate Zarr metadata for faster loading."""
         import zarr
+
         zarr.consolidate_metadata(str(store_path))
         logger.info(f"Consolidated Zarr metadata at: {store_path}")
 
@@ -106,6 +108,7 @@ class ZarrBackend(StorageBackend):
     def delete(self, store_path: Path) -> None:
         """Delete the Zarr store."""
         import shutil
+
         if self.exists(store_path):
             shutil.rmtree(store_path)
             logger.debug(f"Deleted Zarr store at {store_path}")
@@ -450,15 +453,26 @@ class BamStore:
             else:
                 sparse_rows.append(chrom_data_sparse)
 
-        # Stack sparse arrays efficiently
-        data = sparse.stack(sparse_rows)
+        # Stack sparse arrays efficiently (creates 2D array: chromosomes × position)
+        data_2d = sparse.stack(sparse_rows)
 
-        # Create Dataset with sparse data
+        # Wrap sparse array in dask for lazy evaluation and efficient chunking
+        # Chunks: (1 chromosome, 1M positions) for efficient zarr storage
+        dask_array = da.from_array(
+            data_2d,
+            chunks=(1, 1_000_000),
+            asarray=False,  # Keep as sparse
+        )
+
+        # Add sample dimension by expanding to 3D (1 × chromosomes × position)
+        dask_array_3d = dask_array[None, :, :]
+
+        # Create Dataset with dask-wrapped sparse data
         ds_sample = xr.Dataset(
             {
                 "signal": (
                     ["sample", "chromosome", "position"],
-                    data[np.newaxis, :, :],
+                    dask_array_3d,
                 )
             },
             coords={
@@ -509,7 +523,8 @@ class BamStore:
             if not file_path.exists():
                 logger.warning(f"Metadata file not found: {file_path}, skipping")
                 continue
-            logger.info(f"Reading metadata file: {file_path}")
+            base_file_path = file_path.name
+            logger.info(f"Reading metadata file: {base_file_path}")
             df = pd.read_csv(file_path)
             dataframes.append(df)
 
@@ -546,8 +561,6 @@ class BamStore:
 
         # Concatenate all dataframes
         combined_df = pd.concat(dataframes, ignore_index=True)
-
-        logger.info(f"Combined {len(dataframes)} metadata files")
 
         return combined_df
 
@@ -593,6 +606,7 @@ class BamStore:
         # Set up logging if log_file is provided
         if log_file is not None:
             from QuantNado.utils import setup_logging
+
             setup_logging(Path(log_file), verbose=False)
 
         # Load and combine metadata
@@ -660,7 +674,7 @@ class BamStore:
                 if not sample_metadata.empty:
                     # For ChIP samples, verify suffix matches either IP or control
                     assay = sample_metadata["assay"].values[0]
-                    if assay == "ChIP":
+                    if assay == "ChIP" or assay == "CUT&Tag":
                         ip_value = sample_metadata["ip"].values[0]
                         control_value = sample_metadata["control"].values[0]
 
