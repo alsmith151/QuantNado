@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import sparse
 import xarray as xr
+import zarr
 from loguru import logger
 from zarr.storage import ZipStore
 
@@ -76,10 +77,6 @@ def process_chromosome(
     # Dynamically choose dtype based on max value
     max_val = signal.max()
     dtype, dtype_name = _select_optimal_dtype(max_val, contig)
-
-    logger.info(
-        f"  {contig}: {sparsity:.2f}% sparse (max: {max_val:.0f}, dtype: {dtype_name})"
-    )
 
     # Convert signal to chosen dtype
     signal_encoded = signal.astype(dtype)
@@ -155,32 +152,49 @@ def _append_sample_to_store(
     store_path: Path,
     is_first_sample: bool,
 ) -> None:
-    """Append a single sample to the Zarr store."""
+    """
+    Append a single sample to the Zarr store.
 
-    # Create dataset for this sample
-    combined_datasets = []
-    for chrom in chromosomes:
-        chrom_size = chromsizes_dict[chrom]
-        signal_array = sample_data[chrom]
+    This version avoids expensive xarray.concat by preallocating a 2D array
+    with shape (chromosome, position) and inserting chromosome signals directly.
+    """
 
-        # Create Dataset for this chromosome (1 sample)
-        ds_chrom = xr.Dataset(
-            {"signal": (["sample", "position"], signal_array[np.newaxis, :])},
-            coords={
-                "sample": [sample_name],
-                "position": np.arange(chrom_size),
-                "chromosome": chrom,
-            },
-        )
-        combined_datasets.append(ds_chrom)
+    # Determine max chromosome length for padding
+    max_chrom_size = max(chromsizes_dict[chrom] for chrom in chromosomes)
 
-    # Concatenate chromosomes
-    ds_sample = xr.concat(combined_datasets, dim="chromosome", join="outer")
+    # Determine dtype from one chromosome (assuming consistent dtype)
+    # You might want to generalize if sample_data chroms differ in dtype
+    first_chrom = chromosomes[0]
+    dtype = sample_data[first_chrom].dtype
 
-    # Write to store
+    # Preallocate array (chromosome x position), fill with 0 or np.nan as appropriate
+    # Use zeros assuming coverage signals; if missing data should be nan, use np.nan
+    data = np.zeros((len(chromosomes), max_chrom_size), dtype=dtype)
+
+    # Fill in each chromosome's data (padding shorter chromosomes)
+    for i, chrom in enumerate(chromosomes):
+        chrom_data = sample_data[chrom]
+        chrom_len = chromsizes_dict[chrom]
+        data[i, :chrom_len] = chrom_data
+
+        # If padding needed and you want to use NaN instead of 0:
+        # if chrom_len < max_chrom_size:
+        #     data[i, chrom_len:] = np.nan  # Requires float dtype
+
+    # Create Dataset with dimensions (sample, chromosome, position)
+    # Since this is one sample, add sample dimension size=1
+    ds_sample = xr.Dataset(
+        {"signal": (["sample", "chromosome", "position"], data[np.newaxis, :, :])},
+        coords={
+            "sample": np.array([sample_name], dtype="object"),
+            "chromosome": chromosomes,
+            "position": np.arange(max_chrom_size),
+        },
+    )
+
     encoding = {
         "signal": {
-            "chunks": (1, 1, 1_000_000),  # Chunk by (sample, chromosome, position)
+            "chunks": (1, 1, 1_000_000),  # Chunk by sample, chromosome, position
         }
     }
 
@@ -205,44 +219,47 @@ def _append_sample_to_store(
 def _finalize_store(
     store_path: Path,
     sample_id: list,
-    metadata_df: pd.DataFrame | None,
+    metadata: pd.DataFrame | None,
     sparsity_values: list,
     num_chromosomes: int,
 ) -> None:
     """Add metadata and attributes to the final store."""
 
-    # Open the store to add metadata
     ds = xr.open_zarr(store_path, consolidated=False)
 
-    # Add metadata if provided
-    if metadata_df is not None:
+    if metadata is not None:
         logger.info("Adding metadata coordinates...")
-        # Find which column contains the sample names
         sample_col = None
-        for col in metadata_df.columns:
-            if set(metadata_df[col].values) >= set(sample_id):
+        for col in metadata.columns:
+            if set(metadata[col].values) >= set(sample_id):
                 sample_col = col
                 break
 
         if sample_col:
-            # Reindex metadata to match sample order
-            metadata_df = metadata_df.set_index(sample_col).loc[sample_id].reset_index()
+            metadata = metadata.set_index(sample_col).loc[sample_id].reset_index()
 
-            # Add each metadata column as a coordinate
-            for col in metadata_df.columns:
+            # Ensure standard dtypes for all metadata columns
+            for col in metadata.columns:
                 if col != sample_col:
-                    ds = ds.assign_coords({col: ("sample", metadata_df[col].values)})
+                    values = metadata[col].values
+                    # Convert object dtype to string
+                    if values.dtype == object:
+                        values = values.astype(str)
+                    # Convert pandas nullable types to standard numpy types
+                    elif pd.api.types.is_integer_dtype(values):
+                        values = values.astype(int)
+                    elif pd.api.types.is_float_dtype(values):
+                        values = values.astype(float)
+                    ds = ds.assign_coords({col: ("sample", values)})
         else:
             logger.warning("Could not find sample names in metadata DataFrame")
 
-    # Add global attributes
     avg_sparsity = np.mean(sparsity_values) if sparsity_values else 0
     ds.attrs["description"] = "BAM coverage data across all samples and chromosomes"
     ds.attrs["average_sparsity"] = f"{avg_sparsity:.2f}%"
     ds.attrs["num_samples"] = len(sample_id)
     ds.attrs["num_chromosomes"] = num_chromosomes
 
-    # Save back to store
     ds.to_zarr(store_path, mode="a", consolidated=False)
 
 
@@ -262,10 +279,10 @@ def _compress_to_zipstore(source_dir: Path, target_zip: Path) -> None:
         ds.to_zarr(store, mode="w", encoding=encoding, consolidated=False)
 
 
-def _process_with_assay_dimension(
+def _process_assay(
     bam_files: list,
     sample_id: list,
-    metadata_df: pd.DataFrame,
+    metadata: pd.DataFrame,
     chromsizes_dict: dict,
     chromosomes: list,
     temp_store_path: Path,
@@ -283,12 +300,12 @@ def _process_with_assay_dimension(
 
     # Find sample column in metadata - prefer 'sample_id' column
     sample_col = None
-    if "sample_id" in metadata_df.columns:
+    if "sample_id" in metadata.columns:
         sample_col = "sample_id"
     else:
         # Try to find a column that contains sample names
-        for col in metadata_df.columns:
-            if set(metadata_df[col].values) >= set(sample_id):
+        for col in metadata.columns:
+            if set(metadata[col].values) >= set(sample_id):
                 sample_col = col
                 break
 
@@ -296,7 +313,7 @@ def _process_with_assay_dimension(
         raise ValueError(
             f"Could not find sample column in metadata DataFrame. "
             f"Looking for samples: {sample_id[:5]}... "
-            f"Available metadata columns: {list(metadata_df.columns)}"
+            f"Available metadata columns: {list(metadata.columns)}"
         )
 
     # Group samples by assay and track metadata name mapping
@@ -305,7 +322,7 @@ def _process_with_assay_dimension(
 
     for bam_file, sample_name in zip(bam_files, sample_id):
         # Try exact match first
-        sample_metadata = metadata_df[metadata_df[sample_col] == sample_name]
+        sample_metadata = metadata[metadata[sample_col] == sample_name]
 
         # If not found, try fuzzy matching by removing suffix after last underscore
         # This handles ChIP cases like 'SEM-DMSO-H3K27Ac_H3K27Ac' -> 'SEM-DMSO-H3K27Ac'
@@ -314,7 +331,7 @@ def _process_with_assay_dimension(
         if sample_metadata.empty and "_" in sample_name:
             base_name = sample_name.rsplit("_", 1)[0]
             suffix = sample_name.rsplit("_", 1)[1]
-            sample_metadata = metadata_df[metadata_df[sample_col] == base_name]
+            sample_metadata = metadata[metadata[sample_col] == base_name]
 
             if not sample_metadata.empty:
                 # For ChIP samples, verify that the suffix matches either the IP or control
@@ -371,16 +388,16 @@ def _process_with_assay_dimension(
     sample_counter = 0
 
     for assay_idx, (assay_name, assay_data) in enumerate(assay_groups.items(), 1):
-        logger.info(
-            f"[{assay_idx}/{len(assay_groups)}] Processing assay '{assay_name}' with {len(assay_data['sample_id'])} samples"
-        )
-
         for sample_idx, (bam_file, sample_name) in enumerate(
             zip(assay_data["bam_files"], assay_data["sample_id"]), 1
         ):
             sample_counter += 1
+            seqnado_marker = "seqnado_output/"
+            bam_file_short = str(bam_file)
+            if seqnado_marker in bam_file_short:
+                bam_file_short = bam_file_short.split(seqnado_marker, 1)[-1]
             logger.info(
-                f"  [{sample_counter}/{total_samples}] Processing sample '{sample_name}' from {bam_file}"
+                f"Processing [{sample_counter}/{total_samples}] {assay_name} sample {sample_name} from '{bam_file_short}'"
             )
 
             # Process all chromosomes for this sample
@@ -401,7 +418,6 @@ def _process_with_assay_dimension(
                             contig_name, ds_chrom, sparsity = future.result()
                             sample_data[contig_name] = ds_chrom["signal"].values
                             sparsity_values.append(sparsity)
-                            logger.info(f"    Completed chromosome '{contig_name}'")
                         except Exception as e:
                             logger.error(
                                 f"    Failed to process chromosome '{contig}': {e}"
@@ -416,15 +432,12 @@ def _process_with_assay_dimension(
                         )
                         sample_data[contig_name] = ds_chrom["signal"].values
                         sparsity_values.append(sparsity)
-                        logger.info(f"    Completed chromosome '{contig_name}'")
                     except Exception as e:
                         logger.error(
                             f"    Failed to process chromosome '{contig}': {e}"
                         )
                         raise
 
-            # Write this sample to the main store incrementally
-            logger.info(f"    Writing sample '{sample_name}' to store...")
             _append_sample_to_store(
                 sample_data=sample_data,
                 sample_name=sample_name,
@@ -451,14 +464,12 @@ def _process_with_assay_dimension(
     ds_final = ds_final.assign_coords(assay=("sample", assay_coord))
 
     # Add other metadata columns as coordinates
-    for col in metadata_df.columns:
+    for col in metadata.columns:
         if col not in [sample_col, "assay"]:
             metadata_values = []
             for sample_name in processed_samples:
                 metadata_sample_name = sample_to_metadata[sample_name]
-                sample_row = metadata_df[
-                    metadata_df[sample_col] == metadata_sample_name
-                ]
+                sample_row = metadata[metadata[sample_col] == metadata_sample_name]
                 if not sample_row.empty:
                     metadata_values.append(sample_row[col].values[0])
                 else:
@@ -497,11 +508,11 @@ def _process_with_assay_dimension(
 def bams_to_zarr(
     bam_files: list[str],
     chromsizes: str | Path | dict,
-    main_store_path: Path,
+    store_path: Path,
     filter_chromosomes: bool = True,
     max_workers: int = 1,
     overwrite: bool = True,
-    metadata_df: pd.DataFrame | Path | str | None = None,
+    metadata: pd.DataFrame | Path | str | None = None,
     use_zip: bool = False,
     group_by_assay: bool = True,
 ) -> None:
@@ -519,11 +530,11 @@ def bams_to_zarr(
     Parameters:
     - bam_files: List of paths to BAM files.
     - chromsizes: Either a path to a chrom.sizes file or a dictionary mapping chromosome names to sizes.
-    - main_store_path: Path to the main Zarr store.
+    - store_path: Path to the main Zarr store.
     - filter_chromosomes: If True, only include main chromosomes (chr1-22, X, Y, M). Default: True.
     - max_workers: Number of parallel threads for chromosome processing within each BAM. Default: 1.
     - overwrite: If True, overwrite existing store. If False, skip existing samples (resume). Default: True.
-    - metadata_df: Optional metadata as DataFrame, or path to CSV file with sample metadata.
+    - metadata: Optional metadata as DataFrame, or path to CSV file with sample metadata.
                    Must have a column matching sample names and an 'assay' column.
     - use_zip: If True, compress to ZipStore after writing. Default: False (use DirectoryStore).
     - group_by_assay: If True, add assay as a dimension. Requires metadata with 'assay' column. Default: True.
@@ -531,33 +542,15 @@ def bams_to_zarr(
     Returns:
     - None
     """
-    chromsizes_dict = _parse_chromsizes(chromsizes, filter_chromosomes)
-
-    # Load metadata if it's a path
-    if metadata_df is not None and isinstance(metadata_df, (str, Path)):
-        logger.info(f"Loading metadata from {metadata_df}")
-        metadata_df = pd.read_csv(metadata_df)
-
-    # Validate metadata if grouping by assay
-    if group_by_assay:
-        if metadata_df is None:
-            raise ValueError(
-                "group_by_assay=True requires metadata_df with 'assay' column"
-            )
-        if "assay" not in metadata_df.columns:
-            raise ValueError(
-                "metadata_df must have 'assay' column when group_by_assay=True"
-            )
-
     # Determine paths
     if use_zip:
         # Use temporary directory, then compress to zip at end
-        temp_store_path = Path(str(main_store_path).replace(".zarr", ".zarr.tmp"))
-        final_store_path = main_store_path
+        temp_store_path = Path(str(store_path).replace(".zarr", ".zarr.tmp"))
+        final_store_path = store_path
     else:
         # Use directory store directly
-        temp_store_path = main_store_path
-        final_store_path = main_store_path
+        temp_store_path = store_path
+        final_store_path = store_path
 
     # Check if store exists
     if temp_store_path.exists():
@@ -569,24 +562,48 @@ def bams_to_zarr(
                 shutil.rmtree(temp_store_path)
         else:
             logger.info(f"Resuming from existing store: {temp_store_path}")
+    chromsizes_dict = _parse_chromsizes(chromsizes, filter_chromosomes)
 
+    # Load metadata if it's a path
+    if metadata is not None and isinstance(metadata, (str, Path)):
+        logger.info(f"Loading metadata from {metadata}")
+        metadata = pd.read_csv(metadata)
+        # Ensure standard dtypes for all columns
+        for col in metadata.columns:
+            values = metadata[col].values
+            # Use np.str_ instead of np.unicode_
+            if np.issubdtype(values.dtype, np.str_) or values.dtype == object:
+                metadata[col] = metadata[col].astype(str)
+            elif pd.api.types.is_integer_dtype(values):
+                metadata[col] = metadata[col].astype(int)
+            elif pd.api.types.is_float_dtype(values):
+                metadata[col] = metadata[col].astype(float)
+
+    # Validate metadata if grouping by assay
+    if group_by_assay:
+        if metadata is None:
+            raise ValueError(
+                "group_by_assay=True requires metadata with 'assay' column"
+            )
+        if "assay" not in metadata.columns:
+            raise ValueError(
+                "metadata must have 'assay' column when group_by_assay=True"
+            )
+        
     logger.info(
-        f"Processing {len(bam_files)} BAM files into unified dataset: {main_store_path}"
+        f"Processing {len(bam_files)} BAM files into unified dataset: '{store_path}'"
     )
 
     # Extract sample names from BAM files
     sample_id = [Path(f).stem for f in bam_files]
     chromosomes = list(chromsizes_dict.keys())
 
-    logger.info(f"Samples: {sample_id}")
-    logger.info(f"Chromosomes: {chromosomes}")
-
     if group_by_assay:
         # Group samples by assay and process separately
-        _process_with_assay_dimension(
+        _process_assay(
             bam_files=bam_files,
             sample_id=sample_id,
-            metadata_df=metadata_df,
+            metadata=metadata,
             chromsizes_dict=chromsizes_dict,
             chromosomes=chromosomes,
             temp_store_path=temp_store_path,
@@ -615,10 +632,6 @@ def bams_to_zarr(
                     continue
             except Exception:
                 pass  # Store doesn't exist or is invalid, continue processing
-
-        logger.info(
-            f"[{sample_idx}/{len(bam_files)}] Processing sample '{sample_name}' from {bam_file}"
-        )
 
         # Process all chromosomes for this sample
         sample_data = {}
@@ -671,7 +684,7 @@ def bams_to_zarr(
     _finalize_store(
         store_path=temp_store_path,
         sample_id=processed_samples,
-        metadata_df=metadata_df,
+        metadata=metadata,
         sparsity_values=sparsity_values,
         num_chromosomes=len(chromosomes),
     )
@@ -689,3 +702,6 @@ def bams_to_zarr(
     )
     logger.info(f"Average sparsity: {avg_sparsity:.2f}%")
     logger.info(f"Dataset saved to: {final_store_path}")
+    # Consolidate Zarr metadata for faster loading
+    zarr.consolidate_metadata(str(final_store_path))
+    logger.info(f"Consolidated Zarr metadata at: {final_store_path}")
