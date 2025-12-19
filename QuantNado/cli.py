@@ -19,7 +19,7 @@ from loguru import logger
 
 from QuantNado.call_quantile_peaks import call_peaks_from_bigwig_dir
 from QuantNado.make_dataset import make_dataset
-from QuantNado.make_zarr_store import combine_cached_zarrs, process_bam
+from QuantNado.make_zarr_store import bams_to_zarr
 from QuantNado.combine_metadata import combine_metadata_files, find_metadata_files
 
 
@@ -175,40 +175,35 @@ def make_dataset_main():
 
 def make_zarr_main():
     parser = argparse.ArgumentParser(
-        description="Process BAM files and create a Zarr dataset."
+        description="Process BAM files and create a unified Zarr dataset."
     )
     parser.add_argument(
-        "--bam-file",
-        help="Path to a single BAM file to process and cache.",
-    )
-    parser.add_argument(
-        "--cache-dir",
+        "--bam-files",
+        nargs="+",
         required=True,
-        type=Path,
-        help="Directory to store cached Zarr files.",
+        help="Paths to BAM files to process.",
     )
     parser.add_argument(
         "--chromsizes",
+        required=True,
         help="Path to a two-column chromsizes file (chromosome, size).",
+    )
+    parser.add_argument(
+        "--output-path",
+        required=True,
+        type=Path,
+        help="Path to save the unified Zarr dataset.",
+    )
+    parser.add_argument(
+        "--metadata-path",
+        type=Path,
+        help="Path to metadata CSV file (optional).",
     )
     parser.add_argument(
         "--max-workers",
         type=int,
         default=4,
         help="Number of parallel threads for processing chromosomes (default: 4).",
-    )
-    parser.add_argument(
-        "--combine",
-        action="store_true",
-        help="Combine cached Zarr files into a final dataset.",
-    )
-    parser.add_argument(
-        "--metadata-path",
-        help="Path to metadata CSV file.",
-    )
-    parser.add_argument(
-        "--output-path",
-        help="Path to save the combined Zarr dataset.",
     )
     parser.add_argument(
         "--log-file",
@@ -223,35 +218,25 @@ def make_zarr_main():
     if args.log_file.parent != Path(".") and not args.log_file.parent.exists():
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Don't delete the log file - append to it across multiple runs
     _setup_logging(args.log_file, args.verbose)
 
-    if args.bam_file:
-        if not args.chromsizes:
-            raise ValueError("--chromsizes is required when processing BAM files.")
-
-        logger.info(f"Processing {args.bam_file} for all chromosomes")
-        process_bam(
-            bam_file=args.bam_file,
-            chromsizes=args.chromsizes,
-            cache_dir=args.cache_dir,
-            max_workers=args.max_workers,
-        )
-
-    if args.combine:
-        if not args.metadata_path or not args.output_path:
-            raise ValueError(
-                "--metadata-path and --output-path are required for combining datasets."
-            )
-
+    # Load metadata if provided
+    metadata_df = None
+    if args.metadata_path:
+        logger.info(f"Loading metadata from {args.metadata_path}")
         metadata_df = pd.read_csv(args.metadata_path)
-        combine_cached_zarrs(
-            cache_dir=args.cache_dir,
-            metadata_df=metadata_df,
-            output_path=Path(args.output_path),
-        )
 
-    logger.success("Zarr processing complete.")
+    # Process all BAM files into unified Zarr dataset
+    logger.info(f"Processing {len(args.bam_files)} BAM files into {args.output_path}")
+    bams_to_zarr(
+        bam_files=args.bam_files,
+        chromsizes=args.chromsizes,
+        main_store_path=args.output_path,
+        max_workers=args.max_workers,
+        metadata_df=metadata_df,
+    )
+
+    logger.success(f"Zarr dataset created: {args.output_path}")
 
 
 def combine_metadata_main():
