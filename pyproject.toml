@@ -32,7 +32,7 @@ dependencies = [
     "dask",
     "sparse",
     "tqdm",
-    "pysam",
+    "dask-ml",
 ]
 
 [project.optional-dependencies]

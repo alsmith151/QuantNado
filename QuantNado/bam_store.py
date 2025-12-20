@@ -574,10 +574,14 @@ class BamStore:
         if not dataframes:
             raise ValueError("No valid metadata files found")
 
-        # Get all unique columns across all dataframes
+        # Get all unique columns across all dataframes, dropping read-specific columns (r1/r2)
         all_columns = set()
         for df in dataframes:
-            all_columns.update(df.columns)
+            for col in df.columns:
+                col_lower = col.lower()
+                if "r1" in col_lower or "r2" in col_lower:
+                    continue
+                all_columns.add(col)
 
         # Add missing columns to each dataframe with empty/NA values
         for df in dataframes:
@@ -585,19 +589,10 @@ class BamStore:
                 if col not in df.columns:
                     df[col] = ""
 
-        # Define preferred column order
+        # Define preferred column order (sample_id first, rest alphabetical)
         priority_cols = ["sample_id"]
-        deprioritized_cols = sorted(
-            [col for col in all_columns if "r1" in col.lower() or "r2" in col.lower()]
-        )
-        middle_cols = sorted(
-            [
-                col
-                for col in all_columns
-                if col not in priority_cols and col not in deprioritized_cols
-            ]
-        )
-        all_columns_ordered = priority_cols + middle_cols + deprioritized_cols
+        middle_cols = sorted([col for col in all_columns if col not in priority_cols])
+        all_columns_ordered = priority_cols + middle_cols
 
         # Ensure all dataframes have the same column order
         dataframes = [df[all_columns_ordered] for df in dataframes]
