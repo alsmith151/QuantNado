@@ -132,6 +132,7 @@ def reduce_byranges_signal(
         starts = starts[valid]
         ends = ends[valid]
         ranges_df = ranges_df.loc[valid]
+    orig_index = np.asarray(ranges_df.index)
     if starts.size == 0:
         raise ValueError("No valid ranges after clipping to signal length")
 
@@ -156,11 +157,17 @@ def reduce_byranges_signal(
 
     coords: dict[str, object] = {
         "ranges": np.arange(starts.size, dtype=int),
+        "range_index": ("ranges", orig_index),
         "sample": arr.sample.values,
         "start": ("ranges", starts),
         "end": ("ranges", ends),
         "range_length": ("ranges", ends - starts),
     }
+
+    # Propagate per-sample metadata coordinates if present on the input signal.
+    for sample_coord in ("sample_id", "sample_name", "sample_label"):
+        if sample_coord in signal.coords and "sample" in signal[sample_coord].dims:
+            coords[sample_coord] = ("sample", signal[sample_coord].values)
     if contig_col and contig_col in ranges_df.columns:
         coords["contig"] = (
             "ranges",

@@ -4,6 +4,7 @@ from .features import (
     extract_promoters,
     load_gtf,
 )
+from .counts import feature_counts
 from .metadata import extract_metadata
 from .pca import plot_pca_scatter, plot_pca_scree, run_pca
 from .ranges import (

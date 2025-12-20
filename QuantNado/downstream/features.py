@@ -92,11 +92,19 @@ def load_gtf(
 def extract_feature_ranges(
 	gtf_df: pd.DataFrame, feature_type: str = "gene"
 ) -> pd.DataFrame:
-	"""Return ranges for a specific feature type (e.g., gene, transcript, exon)."""
+	"""Return ranges for a specific feature type (e.g., gene, transcript, exon).
+
+	Adds convenience columns:
+	- length: end - start
+	- mid: midpoint of the interval
+	"""
 
 	cols = [c for c in gtf_df.columns if c not in {"attribute"}]
 	subset = gtf_df[gtf_df["feature"] == feature_type][cols].copy()
 	subset = subset.rename(columns={"seqname": "contig"})
+	if not subset.empty:
+		subset["length"] = subset["end"] - subset["start"]
+		subset["mid"] = (subset["start"] + subset["end"]) // 2
 	return subset.reset_index(drop=True)
 
 
